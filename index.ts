@@ -209,11 +209,17 @@ export type BootstrapResult = {
 }
 
 const DEFAULT_BOOTSTRAP_TOPICS: readonly string[] = [
-  'shop/update',
-  'app_subscriptions/update',
-  'orders/create',
-  'orders/cancelled',
-  'app/uninstalled',
+  // Lifecycle — install/uninstall flows + scope audit
+    'shop/update',
+    'app/uninstalled',
+    'app/scopes_update',
+    // Billing — recurring + usage-cap + one-time charges
+    'app_subscriptions/update',
+    'app_subscriptions/approaching_capped_amount',
+    'app_purchases_one_time/update',
+    // Usage — order events for engagement metrics
+    'orders/create',
+    'orders/cancelled',
 ]
 
 const DEFAULT_SHOPIFY_API_VERSION = '2026-04'

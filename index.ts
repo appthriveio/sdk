@@ -160,15 +160,20 @@ export type BulkUpsertMerchantResult = {
  * for each newly-installed shop. The access token is used in-memory
  * only; AppThrive never persists it.
  *
- * Default webhook topics (override with the optional list):
- *   - shop/update                 → ongoing enrichment refresh
- *   - app_subscriptions/update    → billing-state push (complement to Partner API polling)
- *   - orders/create               → order metrics pipeline
- *   - orders/cancelled            → order-cancellation metrics
- *   - app/uninstalled             → fast uninstall detection
+ * Default webhook topics (8 — override with the optional list):
+ *   Lifecycle:  shop/update, app/uninstalled, app/scopes_update
+ *   Billing:    app_subscriptions/update,
+ *               app_subscriptions/approaching_capped_amount,
+ *               app_purchases_one_time/update
+ *   Usage:      orders/create, orders/cancelled
  *
  * Each topic registers a webhook on the shop pointing at
  * https://{baseUrl}/api/webhooks/shopify/{appId}/{topic}.
+ *
+ * ⚠️ CRITICAL: pass `shopifyClientSecret` on the first bootstrap call
+ * for each app. Without it, AppThrive cannot HMAC-verify the webhooks
+ * Shopify sends — uninstalls and plan changes won't propagate. See the
+ * field doc below.
  */
 export type BootstrapInput = {
   /** *.myshopify.com domain. */
@@ -180,11 +185,35 @@ export type BootstrapInput = {
    */
   accessToken: string
   /**
+   * Your Shopify Partner App Client Secret. Required for AppThrive to
+   * HMAC-verify the inbound Shopify webhooks (app/uninstalled,
+   * app_subscriptions/update, etc.) registered by this bootstrap call.
+   *
+   * Find it at: Partner Dashboard → Apps → <your app> → Configuration →
+   * App credentials → **Client secret**. (NOT the API token, NOT a
+   * Webhook secret — the Client secret.)
+   *
+   * Pass via env: `process.env.SHOPIFY_API_SECRET` — the same value
+   * your OAuth flow already uses. Sent ONCE per app (the SDK uploads
+   * it to AppThrive's `/api/ingest/{org}/{app}/shopify-secret`
+   * endpoint where it's encrypted at rest). Re-passing rotates the
+   * stored value.
+   *
+   * Optional. If omitted, `bootstrap()` still runs but `result.
+   * shopifyClientSecretUploaded` is false and webhook deliveries to
+   * AppThrive will fail HMAC verification (500s in your Partner
+   * Dashboard delivery log) until you upload the secret.
+   */
+  shopifyClientSecret?: string
+  /**
    * Override the default webhook topic list. Topics use Shopify's slash
    * format (`shop/update`, `orders/create`, etc.) — the SDK converts
    * to the GraphQL enum form (`SHOP_UPDATE`, `ORDERS_CREATE`).
    * Pass an empty array to skip webhook registration entirely (e.g. if
    * you already register webhooks elsewhere in your app).
+   *
+   * To EXTEND the defaults rather than replace them:
+   *   `webhookTopics: [...defaultBootstrapTopics, 'orders/paid']`
    */
   webhookTopics?: readonly string[]
   /**
@@ -206,21 +235,59 @@ export type BootstrapResult = {
    * critical part; webhooks can be retried.
    */
   webhookErrors: Array<{ topic: string; message: string }>
+  /**
+   * True if `shopifyClientSecret` was supplied and AppThrive accepted it.
+   * False when the input field was omitted, OR when the upload failed
+   * (in which case `shopifyClientSecretError` carries the reason).
+   *
+   * If false, inbound Shopify webhooks won't HMAC-verify on AppThrive's
+   * side — fix by re-bootstrapping with a valid `shopifyClientSecret`.
+   */
+  shopifyClientSecretUploaded: boolean
+  /**
+   * Error message when the upload was attempted and failed. Null when
+   * the input was omitted entirely or the upload succeeded.
+   */
+  shopifyClientSecretError: string | null
 }
 
-const DEFAULT_BOOTSTRAP_TOPICS: readonly string[] = [
+/**
+ * The default set of Shopify Admin webhook topics that `bootstrap()`
+ * registers when no `webhookTopics` argument is supplied.
+ *
+ * Exported so advanced callers can EXTEND (rather than replace) the
+ * defaults — for example, to also subscribe to `orders/paid`:
+ *
+ * ```ts
+ * import { createClient, defaultBootstrapTopics } from '@appthriveio/sdk'
+ *
+ * await client.bootstrap({
+ *   shopDomain,
+ *   accessToken,
+ *   webhookTopics: [...defaultBootstrapTopics, 'orders/paid'],
+ * })
+ * ```
+ *
+ * Passing `webhookTopics` REPLACES the defaults — spread
+ * `defaultBootstrapTopics` first if you want the AppThrive lifecycle
+ * + billing coverage alongside your additions.
+ */
+export const defaultBootstrapTopics = [
   // Lifecycle — install/uninstall flows + scope audit
-    'shop/update',
-    'app/uninstalled',
-    'app/scopes_update',
-    // Billing — recurring + usage-cap + one-time charges
-    'app_subscriptions/update',
-    'app_subscriptions/approaching_capped_amount',
-    'app_purchases_one_time/update',
-    // Usage — order events for engagement metrics
-    'orders/create',
-    'orders/cancelled',
-]
+  'shop/update',
+  'app/uninstalled',
+  'app/scopes_update',
+  // Billing — recurring + usage-cap + one-time charges
+  'app_subscriptions/update',
+  'app_subscriptions/approaching_capped_amount',
+  'app_purchases_one_time/update',
+  // Usage — order events for engagement metrics
+  'orders/create',
+  'orders/cancelled',
+] as const
+
+/** @deprecated use the named export `defaultBootstrapTopics` instead. */
+const DEFAULT_BOOTSTRAP_TOPICS: readonly string[] = defaultBootstrapTopics
 
 const DEFAULT_SHOPIFY_API_VERSION = '2026-04'
 
@@ -485,7 +552,27 @@ export class AppThriveClient {
     }
     const upsert = await this.upsertMerchant(upsertInput)
 
-    // 3. Register webhooks (best-effort).
+    // 3. Upload Shopify Client Secret (best-effort, gated on input).
+    //    Without this, AppThrive cannot verify the HMAC on inbound
+    //    Shopify webhooks — they'll all 500. We attempt before webhook
+    //    registration so by the time the first webhook fires, the
+    //    secret is already on AppThrive's side.
+    let shopifyClientSecretUploaded = false
+    let shopifyClientSecretError: string | null = null
+    if (input.shopifyClientSecret) {
+      try {
+        await this.request(
+          `/api/ingest/${this.orgId}/${this.appId}/shopify-secret`,
+          { shopifyClientSecret: input.shopifyClientSecret },
+        )
+        shopifyClientSecretUploaded = true
+      } catch (err) {
+        shopifyClientSecretError =
+          err instanceof Error ? err.message : 'unknown error'
+      }
+    }
+
+    // 4. Register webhooks (best-effort).
     const webhooksRegistered: string[] = []
     const webhookErrors: BootstrapResult['webhookErrors'] = []
     for (const topic of topics) {
@@ -514,6 +601,8 @@ export class AppThriveClient {
       fieldsWritten: upsert.fieldsWritten,
       webhooksRegistered,
       webhookErrors,
+      shopifyClientSecretUploaded,
+      shopifyClientSecretError,
     }
   }
 

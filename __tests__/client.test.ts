@@ -418,10 +418,14 @@ describe('bootstrap', () => {
     },
   }
 
-  it('runs the full happy-path: shop fetch → upsert → 5 webhook registrations', async () => {
+  it('runs the full happy-path: shop fetch → upsert → 8 webhook registrations', async () => {
     const fetch = queuedFetch([
       { data: SHOP_RESPONSE },
       { data: UPSERT_RESPONSE },
+      // 8 default topics, one webhookSubscriptionCreate call each
+      { data: WEBHOOK_OK },
+      { data: WEBHOOK_OK },
+      { data: WEBHOOK_OK },
       { data: WEBHOOK_OK },
       { data: WEBHOOK_OK },
       { data: WEBHOOK_OK },
@@ -438,12 +442,18 @@ describe('bootstrap', () => {
     expect(r.isNew).toBe(true)
     expect(r.webhooksRegistered).toEqual([
       'shop/update',
+      'app/uninstalled',
+      'app/scopes_update',
       'app_subscriptions/update',
+      'app_subscriptions/approaching_capped_amount',
+      'app_purchases_one_time/update',
       'orders/create',
       'orders/cancelled',
-      'app/uninstalled',
     ])
     expect(r.webhookErrors).toEqual([])
+    // No shopifyClientSecret passed → upload was not attempted.
+    expect(r.shopifyClientSecretUploaded).toBe(false)
+    expect(r.shopifyClientSecretError).toBeNull()
 
     // Assert call ordering
     expect(fetch.mock.calls[0]?.[0]).toBe(
@@ -452,8 +462,8 @@ describe('bootstrap', () => {
     expect(fetch.mock.calls[1]?.[0]).toBe(
       'https://api.test/api/ingest/org_test/app_test/merchant',
     )
-    // Webhook calls 2..6 all hit the same Shopify graphql endpoint
-    for (let i = 2; i < 7; i++) {
+    // Webhook calls 2..9 all hit the same Shopify graphql endpoint
+    for (let i = 2; i < 10; i++) {
       expect(fetch.mock.calls[i]?.[0]).toBe(
         'https://acme.myshopify.com/admin/api/2026-04/graphql.json',
       )
@@ -464,6 +474,9 @@ describe('bootstrap', () => {
     const fetch = queuedFetch([
       { data: SHOP_RESPONSE },
       { data: UPSERT_RESPONSE },
+      { data: WEBHOOK_OK },
+      { data: WEBHOOK_OK },
+      { data: WEBHOOK_OK },
       { data: WEBHOOK_OK },
       { data: WEBHOOK_OK },
       { data: WEBHOOK_OK },
@@ -548,6 +561,9 @@ describe('bootstrap', () => {
       { data: dupErr },
       { data: dupErr },
       { data: dupErr },
+      { data: dupErr },
+      { data: dupErr },
+      { data: dupErr },
     ])
     const c = createClient(baseOpts({ fetch: fetch as unknown as typeof fetch }))
     const r = await c.bootstrap({
@@ -555,7 +571,7 @@ describe('bootstrap', () => {
       accessToken: 't',
     })
     expect(r.webhookErrors).toEqual([])
-    expect(r.webhooksRegistered).toHaveLength(5)
+    expect(r.webhooksRegistered).toHaveLength(8)
   })
 
   it('records webhook registration errors per-topic; merchant upsert still succeeds', async () => {
@@ -570,11 +586,14 @@ describe('bootstrap', () => {
     const fetch = queuedFetch([
       { data: SHOP_RESPONSE },
       { data: UPSERT_RESPONSE },
-      { data: WEBHOOK_OK },
+      { data: WEBHOOK_OK }, // shop/update
+      { data: WEBHOOK_OK }, // app/uninstalled
+      { data: WEBHOOK_OK }, // app/scopes_update
       { data: realErr }, // app_subscriptions/update fails
-      { data: WEBHOOK_OK },
-      { data: WEBHOOK_OK },
-      { data: WEBHOOK_OK },
+      { data: WEBHOOK_OK }, // app_subscriptions/approaching_capped_amount
+      { data: WEBHOOK_OK }, // app_purchases_one_time/update
+      { data: WEBHOOK_OK }, // orders/create
+      { data: WEBHOOK_OK }, // orders/cancelled
     ])
     const c = createClient(baseOpts({ fetch: fetch as unknown as typeof fetch }))
     const r = await c.bootstrap({
@@ -584,9 +603,12 @@ describe('bootstrap', () => {
     expect(r.merchantId).toBe('mer_acme')
     expect(r.webhooksRegistered).toEqual([
       'shop/update',
+      'app/uninstalled',
+      'app/scopes_update',
+      'app_subscriptions/approaching_capped_amount',
+      'app_purchases_one_time/update',
       'orders/create',
       'orders/cancelled',
-      'app/uninstalled',
     ])
     expect(r.webhookErrors).toHaveLength(1)
     expect(r.webhookErrors[0]?.topic).toBe('app_subscriptions/update')
@@ -637,5 +659,128 @@ describe('bootstrap', () => {
       (fetch.mock.calls[2]?.[1] as RequestInit).body as string,
     ) as { variables: { topic: string } }
     expect(webhookBody.variables.topic).toBe('SHOP_UPDATE')
+  })
+
+  // ─── shopifyClientSecret upload (0.1.4) ────────────────────────
+
+  it('uploads shopifyClientSecret to AppThrive between merchant upsert and webhook registration', async () => {
+    const fetch = queuedFetch([
+      { data: SHOP_RESPONSE },
+      { data: UPSERT_RESPONSE },
+      { data: { ok: true, rotated: false } }, // /shopify-secret response
+      // no webhooks (skipped)
+    ])
+    const c = createClient(baseOpts({ fetch: fetch as unknown as typeof fetch }))
+    const r = await c.bootstrap({
+      shopDomain: 'acme.myshopify.com',
+      accessToken: 't',
+      shopifyClientSecret: 'shpss_my_partner_dashboard_client_secret',
+      webhookTopics: [],
+    })
+
+    expect(r.shopifyClientSecretUploaded).toBe(true)
+    expect(r.shopifyClientSecretError).toBeNull()
+    // Call ordering: shop fetch → merchant upsert → secret upload
+    expect(fetch.mock.calls[2]?.[0]).toBe(
+      'https://api.test/api/ingest/org_test/app_test/shopify-secret',
+    )
+    const body = JSON.parse((fetch.mock.calls[2]?.[1] as RequestInit).body as string) as {
+      shopifyClientSecret: string
+    }
+    expect(body.shopifyClientSecret).toBe('shpss_my_partner_dashboard_client_secret')
+    // HMAC headers present (same scheme as upsertMerchant)
+    const headers = (fetch.mock.calls[2]?.[1] as RequestInit).headers as Record<string, string>
+    expect(headers['X-AppThrive-Signature']).toMatch(/^[0-9a-f]{64}$/)
+    expect(headers['X-AppThrive-Timestamp']).toMatch(/^\d+$/)
+  })
+
+  it('captures upload error in shopifyClientSecretError without throwing', async () => {
+    const fetch = queuedFetch([
+      { data: SHOP_RESPONSE },
+      { data: UPSERT_RESPONSE },
+      { ok: false, status: 500, data: { error: 'KMS unavailable' } }, // /shopify-secret 500
+      // no webhooks (skipped)
+    ])
+    const c = createClient(baseOpts({ fetch: fetch as unknown as typeof fetch }))
+    const r = await c.bootstrap({
+      shopDomain: 'acme.myshopify.com',
+      accessToken: 't',
+      shopifyClientSecret: 'shpss_xxxxxxxxxxxxxxxxxxxxxxxx',
+      webhookTopics: [],
+    })
+
+    // Bootstrap does NOT throw — the merchant upsert is still good.
+    expect(r.merchantId).toBe('mer_acme')
+    expect(r.shopifyClientSecretUploaded).toBe(false)
+    expect(r.shopifyClientSecretError).toMatch(/KMS unavailable/)
+  })
+
+  it('skips the upload entirely when shopifyClientSecret is omitted', async () => {
+    const fetch = queuedFetch([
+      { data: SHOP_RESPONSE },
+      { data: UPSERT_RESPONSE },
+      // no /shopify-secret call expected
+    ])
+    const c = createClient(baseOpts({ fetch: fetch as unknown as typeof fetch }))
+    const r = await c.bootstrap({
+      shopDomain: 'acme.myshopify.com',
+      accessToken: 't',
+      webhookTopics: [],
+    })
+
+    expect(r.shopifyClientSecretUploaded).toBe(false)
+    expect(r.shopifyClientSecretError).toBeNull()
+    // Only 2 calls: shop fetch + merchant upsert. No /shopify-secret.
+    expect(fetch).toHaveBeenCalledTimes(2)
+    for (const call of fetch.mock.calls) {
+      expect(call[0]).not.toContain('/shopify-secret')
+    }
+  })
+
+  it('proceeds with webhook registration even if upload fails', async () => {
+    const fetch = queuedFetch([
+      { data: SHOP_RESPONSE },
+      { data: UPSERT_RESPONSE },
+      { ok: false, status: 401, data: { error: 'unauthorized' } }, // /shopify-secret fails
+      { data: WEBHOOK_OK }, // webhook still registers
+    ])
+    const c = createClient(baseOpts({ fetch: fetch as unknown as typeof fetch }))
+    const r = await c.bootstrap({
+      shopDomain: 'acme.myshopify.com',
+      accessToken: 't',
+      shopifyClientSecret: 'shpss_xxxxxxxxxxxxxxxxxxxxxxxx',
+      webhookTopics: ['shop/update'],
+    })
+
+    expect(r.shopifyClientSecretUploaded).toBe(false)
+    expect(r.shopifyClientSecretError).toBeTruthy()
+    expect(r.webhooksRegistered).toEqual(['shop/update'])
+    expect(r.webhookErrors).toEqual([])
+  })
+})
+
+// ─── defaultBootstrapTopics public export (0.1.4) ──────────────
+
+describe('defaultBootstrapTopics export', () => {
+  it('exports the same 8-topic list bootstrap() uses by default', async () => {
+    const { defaultBootstrapTopics } = await import('../index')
+    expect(defaultBootstrapTopics).toEqual([
+      'shop/update',
+      'app/uninstalled',
+      'app/scopes_update',
+      'app_subscriptions/update',
+      'app_subscriptions/approaching_capped_amount',
+      'app_purchases_one_time/update',
+      'orders/create',
+      'orders/cancelled',
+    ])
+  })
+
+  it('callers can extend the defaults via spread', async () => {
+    const { defaultBootstrapTopics } = await import('../index')
+    const extended = [...defaultBootstrapTopics, 'orders/paid', 'fulfillments/create']
+    expect(extended).toContain('shop/update') // default kept
+    expect(extended).toContain('orders/paid') // addition landed
+    expect(extended).toHaveLength(10)
   })
 })

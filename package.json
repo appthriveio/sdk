@@ -1,6 +1,6 @@
 {
     "name": "@appthriveio/sdk",
-    "version": "0.1.3",
+    "version": "0.1.4",
     "description": "AppThrive JS SDK — push merchant data + events from your Shopify app to AppThrive. Zero deps. Web Crypto HMAC. Runs in Node 20+, Bun, Deno, Cloudflare Workers, browsers.",
     "type": "module",
     "main": "./dist/index.js",

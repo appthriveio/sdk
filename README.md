@@ -18,15 +18,37 @@
   })
 
   // In your existing Shopify OAuth callback:
-  await appthrive.bootstrap({ shopDomain, accessToken })
+  await appthrive.bootstrap({
+    shopDomain,
+    accessToken,
+    shopifyClientSecret: process.env.SHOPIFY_API_SECRET!, // ⚠️ required for webhook HMAC
+  })
 
   That single call:
   1. Reads the shop's data via Shopify Admin GraphQL
   2. Posts owner email / plan / address / etc. to AppThrive
-  3. Registers the Shopify webhooks (shop/update, app_subscriptions/update, orders/create, orders/cancelled, app/uninstalled) that keep the
-   data fresh forever
+  3. Uploads your Shopify Client Secret (encrypted at rest) so AppThrive can verify the HMAC on inbound webhooks
+  4. Registers 8 Shopify webhooks (shop/update, app/uninstalled, app/scopes_update, app_subscriptions/update,
+     app_subscriptions/approaching_capped_amount, app_purchases_one_time/update, orders/create, orders/cancelled)
 
   The access token is used in-memory only — never persisted on AppThrive.
+
+  ⚠️ shopifyClientSecret is the **Client secret** from Partner Dashboard → Apps → <your app> → Configuration →
+  App credentials. Without it, AppThrive can't verify HMAC on inbound Shopify webhooks and uninstalls/plan
+  changes won't propagate. Pass once on first bootstrap; re-passing rotates the stored value.
+
+  Customising the topic list
+
+  Pass webhookTopics to bootstrap() to override the default. To EXTEND rather than replace:
+
+  import { createClient, defaultBootstrapTopics } from '@appthriveio/sdk'
+
+  await appthrive.bootstrap({
+    shopDomain,
+    accessToken,
+    shopifyClientSecret: process.env.SHOPIFY_API_SECRET!,
+    webhookTopics: [...defaultBootstrapTopics, 'orders/paid', 'fulfillments/create'],
+  })
 
   Other methods
 

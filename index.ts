@@ -110,6 +110,14 @@ export type ShopifyPlanTier =
 
 export type UpsertMerchantInput = {
   shopId: string
+  /**
+   * Optional `*.myshopify.com` domain. Send this alongside `shopId`
+   * when `shopId` is a GID/numeric so the server populates the
+   * `shop_domain` column with the real myshopify domain instead of
+   * mirroring the GID into it. `bootstrap()` sets this automatically
+   * from Shopify's `shop.myshopifyDomain`.
+   */
+  shopDomain?: string
   shopName?: string | null
   shopOwnerName?: string | null
   shopOwnerEmail?: string | null
@@ -449,6 +457,11 @@ export class AppThriveClient {
     // 2. Map → enrichment fields and upsert.
     const upsertInput: UpsertMerchantInput = {
       shopId: shop.id, // Shopify GID — most stable identifier
+      // Send the myshopify domain alongside the GID so the receiver
+      // populates merchants.shop_domain with the real domain instead
+      // of mirroring the GID into it (the Apr 2026 stub-row bug). Falls
+      // back to the input the caller already validated as *.myshopify.com.
+      shopDomain: shop.myshopifyDomain ?? input.shopDomain,
       shopName: shop.name,
       shopOwnerEmail: shop.email ?? shop.contactEmail ?? null,
       shopOwnerPhone: shop.billingAddress?.phone ?? null,
@@ -772,6 +785,7 @@ function serializeUpsertMerchantInput(input: UpsertMerchantInput): Record<string
   // Each field below is only copied when the caller supplied it. We
   // distinguish "undefined" (don't touch) from "null" (explicit clear).
   const passthrough: Array<keyof UpsertMerchantInput> = [
+    'shopDomain',
     'shopName',
     'shopOwnerName',
     'shopOwnerEmail',

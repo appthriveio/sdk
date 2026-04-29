@@ -485,6 +485,25 @@ describe('bootstrap', () => {
     expect(appthriveHeaders['X-AppThrive-Signature']).toMatch(/^[0-9a-f]{64}$/)
   })
 
+  it('forwards shopDomain alongside the GID so the receiver can populate shop_domain correctly', async () => {
+    const fetch = queuedFetch([
+      { data: SHOP_RESPONSE },
+      { data: UPSERT_RESPONSE },
+    ])
+    const c = createClient(baseOpts({ fetch: fetch as unknown as typeof fetch }))
+    await c.bootstrap({
+      shopDomain: 'acme.myshopify.com',
+      accessToken: 't',
+      webhookTopics: [],
+    })
+    const upsertBody = JSON.parse((fetch.mock.calls[1]?.[1] as RequestInit).body as string) as {
+      shopId: string
+      shopDomain: string
+    }
+    expect(upsertBody.shopId).toBe('gid://shopify/Shop/12345')
+    expect(upsertBody.shopDomain).toBe('acme.myshopify.com')
+  })
+
   it('maps Shopify plan to typed enum; "Shopify Plus" → plus', async () => {
     const fetch = queuedFetch([
       {

@@ -50,12 +50,57 @@
     webhookTopics: [...defaultBootstrapTopics, 'orders/paid', 'fulfillments/create'],
   })
 
+  On-demand re-enrichment (0.2.0+)
+
+  When the AppThrive dashboard's **Re-enrich** button is clicked on a merchant, AppThrive can ask your app to
+  refetch fresh shop data from Shopify Admin GraphQL — without ever holding a per-merchant Shopify token.
+  Two-line setup:
+
+  // 1. Tell the SDK where your handler lives
+  const appthrive = createClient({
+    orgId, appId, webhookSecret,
+    enrichmentCallbackUrl: 'https://yourapp.example/appthrive/enrich',
+  })
+
+  // 2. Mount the handler — Next.js example, same shape works in Hono, Bun.serve, Deno, CF Workers
+  // app/appthrive/enrich/route.ts
+  export const POST = appthrive.createEnrichmentHandler({
+    getAccessToken: async (shopDomain) => {
+      const [s] = await shopifySession.findSessionsByShop(shopDomain)
+      return s?.accessToken ?? null
+    },
+  })
+
+  The SDK auto-registers the URL with AppThrive on the next signed call (via an `X-AppThrive-Enrichment-Url`
+  header on existing ingest traffic — zero extra round-trips). The handler verifies AppThrive's HMAC, looks up
+  the merchant's Shopify access token via your callback, fetches `/shop` GraphQL, and forwards the result
+  through the same `/merchant` ingest endpoint `bootstrap()` uses. Tokens never leave your process.
+
+  Skip it if you don't need on-demand re-enrichment — the Re-enrich button gracefully falls back to a
+  Partner-API sync (limited fields).
+
+  For Express, wrap the handler with a `Request` adapter:
+
+  const handle = appthrive.createEnrichmentHandler({ getAccessToken })
+  app.post('/appthrive/enrich', async (req, res) => {
+    const webReq = new Request(`http://x${req.originalUrl}`, {
+      method: 'POST',
+      headers: req.headers as Record<string, string>,
+      body: JSON.stringify(req.body),
+    })
+    const webRes = await handle(webReq)
+    res.status(webRes.status)
+    webRes.headers.forEach((v, k) => res.setHeader(k, v))
+    res.send(await webRes.text())
+  })
+
   Other methods
 
   - client.upsertMerchant({ shopId, ...fields }) — explicit per-field control
   - client.bulkUpsertMerchants([...]) — up to 100 at a time
   - client.track({ shopId, eventType, payload }) — send custom events
   - client.incrementMetric({ shopId, metric, value }) — push named metric observations
+  - client.createEnrichmentHandler({ getAccessToken }) — on-demand re-enrichment (see above)
 
   Where do I get my credentials?
 

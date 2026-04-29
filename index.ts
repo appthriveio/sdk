@@ -51,6 +51,73 @@ export type AppThriveClientOptions = {
    * Per-request timeout in ms. Default 10000. Set to 0 to disable.
    */
   timeoutMs?: number
+  /**
+   * Phase G — public HTTPS URL where you mount the
+   * `createEnrichmentHandler()` route. The SDK auto-registers this
+   * URL with AppThrive on the next outbound HTTP call by piggybacking
+   * an `X-AppThrive-Enrichment-Url` header (no extra round-trip, no
+   * dashboard config). When the AppThrive dashboard's Re-enrich
+   * button is clicked, AppThrive POSTs a signed enrichment request
+   * to this URL; your handler uses the merchant's session-stored
+   * Shopify Admin token to fetch /shop GraphQL and forwards the
+   * result. Tokens never leave your process.
+   *
+   * Omit to disable on-demand re-enrichment for this app. The
+   * Re-enrich button gracefully falls back to a Partner-API sync
+   * (limited fields) when no callback is registered.
+   */
+  enrichmentCallbackUrl?: string
+}
+
+// ─── Phase G — enrichment handler types ─────────────────────────────
+
+/**
+ * Context passed to the dev's `getAccessToken` callback. Lets the dev
+ * audit-log per-request without re-parsing the wire payload.
+ */
+export type EnrichmentRequestContext = {
+  merchantId: string
+  shopId: string
+  shopDomain: string
+  requestId: string
+  requestedByUserId: string | null
+  reason: 'manual_reenrich' | 'backfill_script'
+}
+
+export type EnrichmentHandlerOptions = {
+  /**
+   * Look up the merchant's Shopify Admin access token from your own
+   * session store. Return `null` if the merchant has uninstalled or
+   * the session is otherwise gone — the handler returns a clean
+   * `NO_SESSION` response without throwing.
+   */
+  getAccessToken: (
+    shopDomain: string,
+    ctx: EnrichmentRequestContext,
+  ) => Promise<string | null> | string | null
+
+  /** Override the Shopify Admin API version used for the shop GraphQL fetch. */
+  shopifyApiVersion?: string
+
+  /**
+   * Optional hook fired AFTER the enrichment ingest succeeds. Errors
+   * are swallowed — the handler still returns 200 to AppThrive.
+   */
+  onSuccess?: (ctx: EnrichmentRequestContext, fieldsWritten: string[]) => void | Promise<void>
+}
+
+/**
+ * Wire shape AppThrive POSTs to the dev's enrichmentCallbackUrl. Pinned
+ * by SDK-INTERFACE.md §4.
+ */
+type EnrichmentRequestPayload = {
+  merchantId: string
+  shopId: string
+  shopDomain: string
+  requestId: string
+  requestedByUserId: string | null
+  reason: 'manual_reenrich' | 'backfill_script'
+  ts: number
 }
 
 export type TrackInput = {
@@ -329,6 +396,16 @@ export class AppThriveClient {
   private readonly webhookSecret: string
   private readonly fetchImpl: typeof fetch
   private readonly timeoutMs: number
+  private readonly enrichmentCallbackUrl: string | null
+  /**
+   * Per-instance, in-memory cache of the etag AppThrive last echoed
+   * back to us for `enrichmentCallbackUrl`. Sent as
+   * `X-AppThrive-Enrichment-Url-Etag` on subsequent calls so the
+   * server can short-circuit identical re-registrations. Lost on
+   * process restart — first request after restart re-registers,
+   * which is one extra ~30-byte header (no extra round-trip).
+   */
+  private cachedEnrichmentEtag: string | null = null
   private keyCache: Promise<CryptoKey> | null = null
 
   constructor(options: AppThriveClientOptions) {
@@ -346,6 +423,14 @@ export class AppThriveClient {
       )
     }
     this.timeoutMs = options.timeoutMs ?? 10_000
+    if (options.enrichmentCallbackUrl) {
+      if (!/^https?:\/\//.test(options.enrichmentCallbackUrl)) {
+        throw new Error('enrichmentCallbackUrl must be a full http(s) URL')
+      }
+      this.enrichmentCallbackUrl = options.enrichmentCallbackUrl
+    } else {
+      this.enrichmentCallbackUrl = null
+    }
   }
 
   /** Push an event. Rejects on network / 4xx / 5xx errors. */
@@ -528,28 +613,7 @@ export class AppThriveClient {
     })
 
     // 2. Map → enrichment fields and upsert.
-    const upsertInput: UpsertMerchantInput = {
-      shopId: shop.id, // Shopify GID — most stable identifier
-      // Send the myshopify domain alongside the GID so the receiver
-      // populates merchants.shop_domain with the real domain instead
-      // of mirroring the GID into it (the Apr 2026 stub-row bug). Falls
-      // back to the input the caller already validated as *.myshopify.com.
-      shopDomain: shop.myshopifyDomain ?? input.shopDomain,
-      shopName: shop.name,
-      shopOwnerEmail: shop.email ?? shop.contactEmail ?? null,
-      shopOwnerPhone: shop.billingAddress?.phone ?? null,
-      shopifyPlan: mapShopifyPlanDisplayNameToTier(shop.plan?.displayName ?? null, shop.plan ?? null),
-      shopifyCreatedAt: shop.createdAt ?? undefined,
-      address1: shop.billingAddress?.address1 ?? null,
-      address2: shop.billingAddress?.address2 ?? null,
-      city: shop.billingAddress?.city ?? null,
-      province: shop.billingAddress?.province ?? null,
-      zip: shop.billingAddress?.zip ?? null,
-      country: shop.billingAddress?.country ?? null,
-      countryCode: shop.billingAddress?.countryCode ?? null,
-      currency: shop.currencyCode ?? null,
-      timezone: shop.ianaTimezone ?? null,
-    }
+    const upsertInput = mapShopToUpsertInput(shop, input.shopDomain)
     const upsert = await this.upsertMerchant(upsertInput)
 
     // 3. Upload Shopify Client Secret (best-effort, gated on input).
@@ -606,6 +670,167 @@ export class AppThriveClient {
     }
   }
 
+  /**
+   * Phase G — return a framework-agnostic Web Fetch handler that
+   * receives signed enrichment requests from AppThrive and round-
+   * trips through Shopify Admin GraphQL to enrich the merchant.
+   *
+   * Mount the returned handler at the URL you set as
+   * `enrichmentCallbackUrl` in `createClient()`. Examples:
+   *
+   *   // Next.js App Router (app/appthrive/enrich/route.ts):
+   *   export const POST = appthrive.createEnrichmentHandler({
+   *     getAccessToken: async (shopDomain) => {
+   *       const [s] = await shopifySession.findSessionsByShop(shopDomain)
+   *       return s?.accessToken ?? null
+   *     },
+   *   })
+   *
+   *   // Hono / Bun.serve / Deno: same shape — `(req: Request) => Promise<Response>`.
+   *
+   * The handler ALWAYS returns HTTP 200 when the request reached it
+   * intact (HMAC verified). Business outcomes are signalled via the
+   * `code` field in the JSON body — `null` on success, or one of
+   * `NO_SESSION` / `TOKEN_REVOKED` / `SHOPIFY_ERROR` / `BAD_REQUEST`
+   * on failure. HMAC verification failure returns 401.
+   *
+   * Tokens never leave your process.
+   */
+  createEnrichmentHandler(opts: EnrichmentHandlerOptions): (req: Request) => Promise<Response> {
+    if (typeof opts.getAccessToken !== 'function') {
+      throw new Error('createEnrichmentHandler: getAccessToken is required')
+    }
+    const apiVersion = opts.shopifyApiVersion ?? DEFAULT_SHOPIFY_API_VERSION
+
+    return async (req: Request): Promise<Response> => {
+      // Read body as text once — the HMAC signature is over the raw body.
+      const rawBody = await req.text()
+      const sigHeader = req.headers.get('x-appthrive-signature')
+      const tsHeader = req.headers.get('x-appthrive-timestamp')
+
+      if (!sigHeader || !tsHeader) {
+        return jsonResponse(401, { error: 'Missing signature headers' })
+      }
+      const timestamp = Number(tsHeader)
+      if (!Number.isFinite(timestamp)) {
+        return jsonResponse(401, { error: 'Invalid timestamp header' })
+      }
+      const drift = Math.abs(Math.floor(Date.now() / 1000) - timestamp)
+      if (drift > 300) {
+        return jsonResponse(401, { error: 'Timestamp outside 5-minute window' })
+      }
+
+      // Compute expected signature and compare. Web Crypto's verify path
+      // already runs in constant time when the signatures are the same
+      // length; we ensure that with a length pre-check.
+      const expected = await this.sign(`${timestamp}.${rawBody}`)
+      if (!constantTimeEqual(expected, sigHeader)) {
+        return jsonResponse(401, { error: 'Signature verification failed' })
+      }
+
+      let payload: EnrichmentRequestPayload
+      try {
+        payload = parseEnrichmentRequestPayload(JSON.parse(rawBody))
+      } catch (err) {
+        return jsonResponse(200, {
+          ok: false,
+          code: 'BAD_REQUEST',
+          message: err instanceof Error ? err.message : 'Invalid request body',
+        })
+      }
+
+      const ctx: EnrichmentRequestContext = {
+        merchantId: payload.merchantId,
+        shopId: payload.shopId,
+        shopDomain: payload.shopDomain,
+        requestId: payload.requestId,
+        requestedByUserId: payload.requestedByUserId,
+        reason: payload.reason,
+      }
+
+      let accessToken: string | null
+      try {
+        accessToken = await opts.getAccessToken(payload.shopDomain, ctx)
+      } catch (err) {
+        return jsonResponse(200, {
+          ok: false,
+          code: 'NO_SESSION',
+          message: `getAccessToken threw: ${err instanceof Error ? err.message : 'unknown'}`,
+        })
+      }
+      if (!accessToken) {
+        return jsonResponse(200, {
+          ok: false,
+          code: 'NO_SESSION',
+          message: `No active Shopify session found for ${payload.shopDomain}`,
+        })
+      }
+
+      // Fetch shop GraphQL. Map any AppThriveError back to a wire code.
+      let shop: ShopifyShop
+      try {
+        shop = await fetchShopifyShop({
+          shopDomain: payload.shopDomain,
+          accessToken,
+          apiVersion,
+          fetchImpl: this.fetchImpl,
+          timeoutMs: this.timeoutMs,
+        })
+      } catch (err) {
+        if (err instanceof AppThriveError) {
+          // 401 from Shopify means the token is no longer valid.
+          if (err.status === 401 || err.code === 'UNAUTHORIZED') {
+            return jsonResponse(200, {
+              ok: false,
+              code: 'TOKEN_REVOKED',
+              message: err.message,
+            })
+          }
+          return jsonResponse(200, {
+            ok: false,
+            code: 'SHOPIFY_ERROR',
+            message: err.message,
+          })
+        }
+        return jsonResponse(200, {
+          ok: false,
+          code: 'SHOPIFY_ERROR',
+          message: err instanceof Error ? err.message : 'Unknown Shopify error',
+        })
+      }
+
+      // Forward to AppThrive enrichment ingest.
+      const upsertInput = mapShopToUpsertInput(shop, payload.shopDomain)
+      let upsert
+      try {
+        upsert = await this.upsertMerchant(upsertInput)
+      } catch (err) {
+        // The ingest call itself failed (network / 5xx on AppThrive
+        // side). Surface as SHOPIFY_ERROR-shaped so AppThrive's
+        // dispatcher retries — that's the closest existing kind.
+        return jsonResponse(200, {
+          ok: false,
+          code: 'SHOPIFY_ERROR',
+          message: `Enrichment ingest failed: ${err instanceof Error ? err.message : 'unknown'}`,
+        })
+      }
+
+      if (opts.onSuccess) {
+        try {
+          await opts.onSuccess(ctx, upsert.fieldsWritten)
+        } catch {
+          // Swallow — we still return 200 to AppThrive.
+        }
+      }
+
+      return jsonResponse(200, {
+        ok: true,
+        code: null,
+        fieldsWritten: upsert.fieldsWritten,
+      })
+    }
+  }
+
   private async signingKey(): Promise<CryptoKey> {
     if (this.keyCache) return this.keyCache
     this.keyCache = globalThis.crypto.subtle.importKey(
@@ -641,6 +866,17 @@ export class AppThriveClient {
     if (options.idempotencyKey) {
       headers['X-AppThrive-Idempotency-Key'] = options.idempotencyKey
     }
+    // Phase G — piggyback enrichment-URL registration on every signed
+    // call. AppThrive's middleware reads these headers as a side-effect
+    // and echoes the current etag in the response (see SDK-INTERFACE.md
+    // §3). Sending the cached etag short-circuits redundant DB writes
+    // server-side. Zero extra round-trips.
+    if (this.enrichmentCallbackUrl) {
+      headers['X-AppThrive-Enrichment-Url'] = this.enrichmentCallbackUrl
+      if (this.cachedEnrichmentEtag) {
+        headers['X-AppThrive-Enrichment-Url-Etag'] = this.cachedEnrichmentEtag
+      }
+    }
 
     const controller = this.timeoutMs > 0 ? new AbortController() : null
     const timer = controller ? setTimeout(() => controller.abort(), this.timeoutMs) : null
@@ -661,6 +897,13 @@ export class AppThriveClient {
       throw new AppThriveError('NETWORK_ERROR', message)
     } finally {
       if (timer) clearTimeout(timer)
+    }
+
+    // Phase G — capture etag echo so subsequent requests can skip
+    // re-registration. Header lookup is case-insensitive per Fetch spec.
+    if (this.enrichmentCallbackUrl) {
+      const echoed = response.headers.get('x-appthrive-enrichment-url-etag')
+      if (echoed) this.cachedEnrichmentEtag = echoed
     }
 
     if (response.ok) {
@@ -870,6 +1113,38 @@ function mapShopifyPlanDisplayNameToTier(
 }
 
 /**
+ * Map a Shopify shop GraphQL response into UpsertMerchantInput. Shared
+ * by `bootstrap()` (install-time) and `createEnrichmentHandler()`
+ * (on-demand re-enrichment) so they emit identical wire shapes.
+ *
+ * `fallbackDomain` is used when `shop.myshopifyDomain` is missing —
+ * historically it shouldn't be, but the GraphQL field is nullable.
+ */
+function mapShopToUpsertInput(shop: ShopifyShop, fallbackDomain: string): UpsertMerchantInput {
+  return {
+    shopId: shop.id, // Shopify GID — most stable identifier
+    // Send the myshopify domain alongside the GID so the receiver
+    // populates merchants.shop_domain with the real domain instead
+    // of mirroring the GID into it (the Apr 2026 stub-row bug).
+    shopDomain: shop.myshopifyDomain ?? fallbackDomain,
+    shopName: shop.name,
+    shopOwnerEmail: shop.email ?? shop.contactEmail ?? null,
+    shopOwnerPhone: shop.billingAddress?.phone ?? null,
+    shopifyPlan: mapShopifyPlanDisplayNameToTier(shop.plan?.displayName ?? null, shop.plan ?? null),
+    shopifyCreatedAt: shop.createdAt ?? undefined,
+    address1: shop.billingAddress?.address1 ?? null,
+    address2: shop.billingAddress?.address2 ?? null,
+    city: shop.billingAddress?.city ?? null,
+    province: shop.billingAddress?.province ?? null,
+    zip: shop.billingAddress?.zip ?? null,
+    country: shop.billingAddress?.country ?? null,
+    countryCode: shop.billingAddress?.countryCode ?? null,
+    currency: shop.currencyCode ?? null,
+    timezone: shop.ianaTimezone ?? null,
+  }
+}
+
+/**
  * Convert UpsertMerchantInput → wire shape. shopifyCreatedAt is normalised
  * to ISO-8601 (Date or string both accepted at the SDK boundary). Fields
  * left undefined are NOT sent — the server-side helper only writes fields
@@ -922,6 +1197,73 @@ function bytesToHex(bytes: Uint8Array): string {
     hex += b.toString(16).padStart(2, '0')
   }
   return hex
+}
+
+// ─── Phase G — enrichment handler helpers ───────────────────────────
+
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+
+/**
+ * Constant-time string equality. Both values must be hex strings of
+ * the same length (HMAC-SHA256 hex always 64 chars). Returns false
+ * immediately on length mismatch — that's not a timing leak because
+ * length is observable from the protocol shape.
+ */
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  }
+  return diff === 0
+}
+
+/**
+ * Parse + shape-validate an inbound enrichment request body. Manual
+ * validation rather than zod because the SDK is zero-dep. Throws on
+ * any missing or wrong-typed field; the handler maps to BAD_REQUEST.
+ */
+function parseEnrichmentRequestPayload(raw: unknown): EnrichmentRequestPayload {
+  if (!raw || typeof raw !== 'object') throw new Error('body must be a JSON object')
+  const r = raw as Record<string, unknown>
+  const requireString = (key: string): string => {
+    const v = r[key]
+    if (typeof v !== 'string' || v.length === 0) {
+      throw new Error(`missing or invalid field: ${key}`)
+    }
+    return v
+  }
+  const requireNullableString = (key: string): string | null => {
+    const v = r[key]
+    if (v === null) return null
+    if (typeof v !== 'string') throw new Error(`field must be string or null: ${key}`)
+    return v
+  }
+  const requireNumber = (key: string): number => {
+    const v = r[key]
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      throw new Error(`missing or invalid number field: ${key}`)
+    }
+    return v
+  }
+  const reasonRaw = r.reason
+  if (reasonRaw !== 'manual_reenrich' && reasonRaw !== 'backfill_script') {
+    throw new Error(`reason must be 'manual_reenrich' or 'backfill_script', got: ${String(reasonRaw)}`)
+  }
+  return {
+    merchantId: requireString('merchantId'),
+    shopId: requireString('shopId'),
+    shopDomain: requireString('shopDomain'),
+    requestId: requireString('requestId'),
+    requestedByUserId: requireNullableString('requestedByUserId'),
+    reason: reasonRaw,
+    ts: requireNumber('ts'),
+  }
 }
 
 function safeParseError(text: string): string | null {

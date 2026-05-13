@@ -418,13 +418,11 @@ describe('bootstrap', () => {
     },
   }
 
-  it('runs the full happy-path: shop fetch → upsert → 8 webhook registrations', async () => {
+  it('runs the full happy-path: shop fetch → upsert → 6 webhook registrations', async () => {
     const fetch = queuedFetch([
       { data: SHOP_RESPONSE },
       { data: UPSERT_RESPONSE },
-      // 8 default topics, one webhookSubscriptionCreate call each
-      { data: WEBHOOK_OK },
-      { data: WEBHOOK_OK },
+      // 6 default topics, one webhookSubscriptionCreate call each
       { data: WEBHOOK_OK },
       { data: WEBHOOK_OK },
       { data: WEBHOOK_OK },
@@ -447,8 +445,6 @@ describe('bootstrap', () => {
       'app_subscriptions/update',
       'app_subscriptions/approaching_capped_amount',
       'app_purchases_one_time/update',
-      'orders/create',
-      'orders/cancelled',
     ])
     expect(r.webhookErrors).toEqual([])
     // No shopifyClientSecret passed → upload was not attempted.
@@ -462,8 +458,8 @@ describe('bootstrap', () => {
     expect(fetch.mock.calls[1]?.[0]).toBe(
       'https://api.test/api/ingest/org_test/app_test/merchant',
     )
-    // Webhook calls 2..9 all hit the same Shopify graphql endpoint
-    for (let i = 2; i < 10; i++) {
+    // Webhook calls 2..7 all hit the same Shopify graphql endpoint
+    for (let i = 2; i < 8; i++) {
       expect(fetch.mock.calls[i]?.[0]).toBe(
         'https://acme.myshopify.com/admin/api/2026-04/graphql.json',
       )
@@ -474,8 +470,6 @@ describe('bootstrap', () => {
     const fetch = queuedFetch([
       { data: SHOP_RESPONSE },
       { data: UPSERT_RESPONSE },
-      { data: WEBHOOK_OK },
-      { data: WEBHOOK_OK },
       { data: WEBHOOK_OK },
       { data: WEBHOOK_OK },
       { data: WEBHOOK_OK },
@@ -562,8 +556,6 @@ describe('bootstrap', () => {
       { data: dupErr },
       { data: dupErr },
       { data: dupErr },
-      { data: dupErr },
-      { data: dupErr },
     ])
     const c = createClient(baseOpts({ fetch: fetch as unknown as typeof fetch }))
     const r = await c.bootstrap({
@@ -571,7 +563,7 @@ describe('bootstrap', () => {
       accessToken: 't',
     })
     expect(r.webhookErrors).toEqual([])
-    expect(r.webhooksRegistered).toHaveLength(8)
+    expect(r.webhooksRegistered).toHaveLength(6)
   })
 
   it('records webhook registration errors per-topic; merchant upsert still succeeds', async () => {
@@ -592,8 +584,6 @@ describe('bootstrap', () => {
       { data: realErr }, // app_subscriptions/update fails
       { data: WEBHOOK_OK }, // app_subscriptions/approaching_capped_amount
       { data: WEBHOOK_OK }, // app_purchases_one_time/update
-      { data: WEBHOOK_OK }, // orders/create
-      { data: WEBHOOK_OK }, // orders/cancelled
     ])
     const c = createClient(baseOpts({ fetch: fetch as unknown as typeof fetch }))
     const r = await c.bootstrap({
@@ -607,8 +597,6 @@ describe('bootstrap', () => {
       'app/scopes_update',
       'app_subscriptions/approaching_capped_amount',
       'app_purchases_one_time/update',
-      'orders/create',
-      'orders/cancelled',
     ])
     expect(r.webhookErrors).toHaveLength(1)
     expect(r.webhookErrors[0]?.topic).toBe('app_subscriptions/update')
@@ -759,10 +747,10 @@ describe('bootstrap', () => {
   })
 })
 
-// ─── defaultBootstrapTopics public export (0.1.4) ──────────────
+// ─── defaultBootstrapTopics public export (0.1.4, narrowed 0.3.0) ──────
 
 describe('defaultBootstrapTopics export', () => {
-  it('exports the same 8-topic list bootstrap() uses by default', async () => {
+  it('exports the same 6-topic list bootstrap() uses by default', async () => {
     const { defaultBootstrapTopics } = await import('../index')
     expect(defaultBootstrapTopics).toEqual([
       'shop/update',
@@ -771,16 +759,39 @@ describe('defaultBootstrapTopics export', () => {
       'app_subscriptions/update',
       'app_subscriptions/approaching_capped_amount',
       'app_purchases_one_time/update',
-      'orders/create',
-      'orders/cancelled',
     ])
+  })
+
+  it('does NOT include the commerce topics deprecated in 0.3.0', async () => {
+    const { defaultBootstrapTopics } = await import('../index')
+    // AppThrive 410's all of these — they must stay out of defaults so
+    // bootstrap() doesn't waste a webhookSubscriptionCreate call that's
+    // guaranteed to auto-disable within 48h.
+    for (const dep of [
+      'orders/create',
+      'orders/paid',
+      'orders/cancelled',
+      'orders/fulfilled',
+      'refunds/create',
+      'products/create',
+      'products/update',
+      'products/delete',
+      'customers/create',
+      'customers/update',
+      'carts/create',
+      'carts/update',
+      'checkouts/create',
+      'checkouts/update',
+    ]) {
+      expect(defaultBootstrapTopics).not.toContain(dep)
+    }
   })
 
   it('callers can extend the defaults via spread', async () => {
     const { defaultBootstrapTopics } = await import('../index')
-    const extended = [...defaultBootstrapTopics, 'orders/paid', 'fulfillments/create']
+    const extended = [...defaultBootstrapTopics, 'inventory_levels/update', 'fulfillments/create']
     expect(extended).toContain('shop/update') // default kept
-    expect(extended).toContain('orders/paid') // addition landed
-    expect(extended).toHaveLength(10)
+    expect(extended).toContain('inventory_levels/update') // addition landed
+    expect(extended).toHaveLength(8)
   })
 })

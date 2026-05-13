@@ -227,15 +227,21 @@ export type BulkUpsertMerchantResult = {
  * for each newly-installed shop. The access token is used in-memory
  * only; AppThrive never persists it.
  *
- * Default webhook topics (8 — override with the optional list):
+ * Default webhook topics (6 — override with the optional list):
  *   Lifecycle:  shop/update, app/uninstalled, app/scopes_update
  *   Billing:    app_subscriptions/update,
  *               app_subscriptions/approaching_capped_amount,
  *               app_purchases_one_time/update
- *   Usage:      orders/create, orders/cancelled
  *
  * Each topic registers a webhook on the shop pointing at
  * https://{baseUrl}/api/webhooks/shopify/{appId}/{topic}.
+ *
+ * Commerce topics (orders/*, products/*, customers/*, carts/*,
+ * checkouts/*, refunds/*) are NOT registered by default — AppThrive
+ * returns HTTP 410 Gone for those. To send commerce-derived metrics,
+ * call `appthrive.track({ metrics: [...] })` from your own webhook
+ * handlers, applying your own business logic. AppThrive is a
+ * merchant-success platform, not a commerce data store.
  *
  * ⚠️ CRITICAL: pass `shopifyClientSecret` on the first bootstrap call
  * for each app. Without it, AppThrive cannot HMAC-verify the webhooks
@@ -274,13 +280,20 @@ export type BootstrapInput = {
   shopifyClientSecret?: string
   /**
    * Override the default webhook topic list. Topics use Shopify's slash
-   * format (`shop/update`, `orders/create`, etc.) — the SDK converts
-   * to the GraphQL enum form (`SHOP_UPDATE`, `ORDERS_CREATE`).
-   * Pass an empty array to skip webhook registration entirely (e.g. if
-   * you already register webhooks elsewhere in your app).
+   * format (`shop/update`, `app_subscriptions/update`, etc.) — the SDK
+   * converts to the GraphQL enum form (`SHOP_UPDATE`,
+   * `APP_SUBSCRIPTIONS_UPDATE`). Pass an empty array to skip webhook
+   * registration entirely (e.g. if you already register webhooks
+   * elsewhere in your app).
    *
    * To EXTEND the defaults rather than replace them:
-   *   `webhookTopics: [...defaultBootstrapTopics, 'orders/paid']`
+   *   `webhookTopics: [...defaultBootstrapTopics, 'inventory_levels/update']`
+   *
+   * Commerce topics (orders/*, products/*, customers/*, carts/*,
+   * checkouts/*, refunds/*) are 410'd by AppThrive — registering them
+   * here will succeed at Shopify but every delivery will fail until
+   * Shopify auto-disables (~48h). Use `appthrive.track()` with a
+   * `metrics[]` payload from your own webhook handlers instead.
    */
   webhookTopics?: readonly string[]
   /**
@@ -323,7 +336,7 @@ export type BootstrapResult = {
  * registers when no `webhookTopics` argument is supplied.
  *
  * Exported so advanced callers can EXTEND (rather than replace) the
- * defaults — for example, to also subscribe to `orders/paid`:
+ * defaults — for example, to also subscribe to inventory updates:
  *
  * ```ts
  * import { createClient, defaultBootstrapTopics } from '@appthriveio/sdk'
@@ -331,13 +344,20 @@ export type BootstrapResult = {
  * await client.bootstrap({
  *   shopDomain,
  *   accessToken,
- *   webhookTopics: [...defaultBootstrapTopics, 'orders/paid'],
+ *   webhookTopics: [...defaultBootstrapTopics, 'inventory_levels/update'],
  * })
  * ```
  *
  * Passing `webhookTopics` REPLACES the defaults — spread
  * `defaultBootstrapTopics` first if you want the AppThrive lifecycle
  * + billing coverage alongside your additions.
+ *
+ * Changed in 0.3.0: dropped `orders/create` and `orders/cancelled`.
+ * AppThrive no longer pulls commerce data from Shopify webhooks
+ * (orders, products, customers, carts, checkouts, refunds — all 410'd
+ * by the receiver). Send commerce-derived metrics via
+ * `appthrive.track({ metrics: [...] })` from your own webhook handlers
+ * instead, applying your own business logic.
  */
 export const defaultBootstrapTopics = [
   // Lifecycle — install/uninstall flows + scope audit
@@ -348,9 +368,6 @@ export const defaultBootstrapTopics = [
   'app_subscriptions/update',
   'app_subscriptions/approaching_capped_amount',
   'app_purchases_one_time/update',
-  // Usage — order events for engagement metrics
-  'orders/create',
-  'orders/cancelled',
 ] as const
 
 /** @deprecated use the named export `defaultBootstrapTopics` instead. */
@@ -992,8 +1009,9 @@ const WEBHOOK_MUTATION = `
 `
 
 /**
- * Convert "shop/update" / "orders/create" → "SHOP_UPDATE" / "ORDERS_CREATE".
- * Shopify's WebhookSubscriptionTopic enum uses the all-caps form.
+ * Convert "shop/update" / "app_subscriptions/update" →
+ * "SHOP_UPDATE" / "APP_SUBSCRIPTIONS_UPDATE". Shopify's
+ * WebhookSubscriptionTopic enum uses the all-caps form.
  */
 function topicSlashToEnum(topic: string): string {
   return topic.replace(/[/.]/g, '_').toUpperCase()

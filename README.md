@@ -28,14 +28,32 @@
   1. Reads the shop's data via Shopify Admin GraphQL
   2. Posts owner email / plan / address / etc. to AppThrive
   3. Uploads your Shopify Client Secret (encrypted at rest) so AppThrive can verify the HMAC on inbound webhooks
-  4. Registers 8 Shopify webhooks (shop/update, app/uninstalled, app/scopes_update, app_subscriptions/update,
-     app_subscriptions/approaching_capped_amount, app_purchases_one_time/update, orders/create, orders/cancelled)
+  4. Registers 6 Shopify webhooks (shop/update, app/uninstalled, app/scopes_update, app_subscriptions/update,
+     app_subscriptions/approaching_capped_amount, app_purchases_one_time/update)
 
   The access token is used in-memory only — never persisted on AppThrive.
 
   ⚠️ shopifyClientSecret is the **Client secret** from Partner Dashboard → Apps → <your app> → Configuration →
   App credentials. Without it, AppThrive can't verify HMAC on inbound Shopify webhooks and uninstalls/plan
   changes won't propagate. Pass once on first bootstrap; re-passing rotates the stored value.
+
+  Commerce data (orders, products, customers, carts, checkouts, refunds)
+
+  AppThrive returns HTTP 410 Gone for the Shopify commerce topics — they're intentionally NOT in the default
+  registration set. Apply your own business logic in your existing webhook handlers and push only the merchant-
+  success-relevant metrics into AppThrive via `track()`:
+
+  // inside your own orders/paid handler:
+  await appthrive.track({
+    event: 'order_paid',
+    shopId: shopDomain,
+    metrics: [
+      { name: 'orders_generated', op: 'increment', value: 1 },
+      { name: 'gmv_cents', op: 'increment', value: totalPriceCents },
+    ],
+  })
+
+  This keeps AppThrive a merchant-success store (rollups + scores), not a commerce data store.
 
   Customising the topic list
 
@@ -47,7 +65,7 @@
     shopDomain,
     accessToken,
     shopifyClientSecret: process.env.SHOPIFY_API_SECRET!,
-    webhookTopics: [...defaultBootstrapTopics, 'orders/paid', 'fulfillments/create'],
+    webhookTopics: [...defaultBootstrapTopics, 'inventory_levels/update', 'fulfillments/create'],
   })
 
   On-demand re-enrichment (0.2.0+)
